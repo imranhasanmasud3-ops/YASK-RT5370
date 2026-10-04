@@ -1,0 +1,148 @@
+name: Build YASK CLO + USB Wi-Fi + embedded RT firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libelf-dev pahole cpio rsync aria2 unzip zip wget git
+
+      - name: Fetch exact kernel source and YASK AnyKernel
+        run: |
+          git clone --depth=1 --branch kernel.lnx.5.15.r1-rel \
+            https://github.com/Mint-Kernel/kernel-msm.git kernel
+          wget -q --show-progress -O anykernel.zip \
+            https://github.com/topnotchfreaks/kernel_msm-5.15/releases/download/YASK-NEXT/Anykernel3_YASK-ReSukiSU-AIO-FULL_2026-09-20.zip
+          mkdir anykernel
+          unzip -q anykernel.zip -d anykernel
+          test -s anykernel/Image.clo.ksu
+
+      - name: Install matching Android clang r547379
+        run: |
+          mkdir -p toolchain
+          aria2c -x 16 -s 16 -o clang.tar.gz \
+            https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz
+          tar -xzf clang.tar.gz -C toolchain
+          echo "$PWD/toolchain/clang-r547379/bin" >> "$GITHUB_PATH"
+          clang --version | head -2
+
+      - name: Download RT2800USB firmware
+        run: |
+          mkdir -p kernel/firmware
+          wget -q --show-progress -O kernel/firmware/rt2870.bin \
+            https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260410/rt2870.bin
+          wget -q --show-progress -O kernel/firmware/LICENSE.ralink-firmware.txt \
+            https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260410/LICENCE.ralink-firmware.txt
+          test "$(stat -c %s kernel/firmware/rt2870.bin)" = "8192"
+          sha256sum kernel/firmware/rt2870.bin
+
+      - name: Recover exact YASK config and enable USB Wi-Fi
+        working-directory: kernel
+        run: |
+          scripts/extract-ikconfig "$GITHUB_WORKSPACE/anykernel/Image.clo.ksu" > .config
+          test -s .config
+          cp .config arch/arm64/configs/yask_usb_defconfig
+          CFG=arch/arm64/configs/yask_usb_defconfig
+
+          scripts/config --file "$CFG" --disable TRIM_UNUSED_KSYMS
+          scripts/config --file "$CFG" --set-str LOCALVERSION "-YASK-USB"
+
+          # Core wireless stack
+          scripts/config --file "$CFG" --enable CFG80211
+          scripts/config --file "$CFG" --enable MAC80211
+          scripts/config --file "$CFG" --enable RFKILL
+          scripts/config --file "$CFG" --enable EEPROM_93CX6
+          scripts/config --file "$CFG" --enable CRC_CCITT
+          scripts/config --file "$CFG" --enable CRC_ITU_T
+
+          # Ralink/MediaTek RT2x00: RT5370 is RT2800USB + RT53XX support.
+          scripts/config --file "$CFG" --enable RT2X00
+          scripts/config --file "$CFG" --enable RT2500USB
+          scripts/config --file "$CFG" --enable RT73USB
+          scripts/config --file "$CFG" --enable RT2800USB
+          scripts/config --file "$CFG" --enable RT2800USB_RT33XX
+          scripts/config --file "$CFG" --enable RT2800USB_RT35XX
+          scripts/config --file "$CFG" --enable RT2800USB_RT3573
+          scripts/config --file "$CFG" --enable RT2800USB_RT53XX
+          scripts/config --file "$CFG" --enable RT2800USB_RT55XX
+          scripts/config --file "$CFG" --enable RT2800USB_UNKNOWN
+
+          # Other common USB WLAN families.
+          scripts/config --file "$CFG" --enable MT7601U
+          scripts/config --file "$CFG" --enable MT76_CORE
+          scripts/config --file "$CFG" --enable MT76_USB
+          scripts/config --file "$CFG" --enable MT76x02_LIB
+          scripts/config --file "$CFG" --enable MT76x02_USB
+          scripts/config --file "$CFG" --enable MT76x0U
+          scripts/config --file "$CFG" --enable MT76x2U
+          scripts/config --file "$CFG" --enable RTL8187
+          scripts/config --file "$CFG" --enable RTLWIFI
+          scripts/config --file "$CFG" --enable RTLWIFI_USB
+          scripts/config --file "$CFG" --enable RTL8192C_COMMON
+          scripts/config --file "$CFG" --enable RTL8192CU
+          scripts/config --file "$CFG" --enable RTL8XXXU
+          scripts/config --file "$CFG" --enable RTL8XXXU_UNTESTED
+          scripts/config --file "$CFG" --enable AR5523
+          scripts/config --file "$CFG" --enable ATH9K_HTC
+          scripts/config --file "$CFG" --enable CARL9170
+          scripts/config --file "$CFG" --enable MWIFIEX_USB
+          scripts/config --file "$CFG" --enable LIBERTAS_USB
+          scripts/config --file "$CFG" --enable P54_USB
+          scripts/config --file "$CFG" --enable ORINOCO_USB
+          scripts/config --file "$CFG" --enable RSI_USB
+          scripts/config --file "$CFG" --enable ZD1211RW
+          scripts/config --file "$CFG" --enable USB_ZD1201
+          scripts/config --file "$CFG" --enable AT76C50X_USB
+          scripts/config --file "$CFG" --enable BRCMFMAC_USB
+
+          # Embed rt2870.bin so Android does not depend on /vendor/firmware.
+          scripts/config --file "$CFG" --set-str EXTRA_FIRMWARE "rt2870.bin"
+          scripts/config --file "$CFG" --set-str EXTRA_FIRMWARE_DIR "$GITHUB_WORKSPACE/kernel/firmware"
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          make O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCONFIG_CONFIG="$GITHUB_WORKSPACE/out/.config" yask_usb_defconfig
+          make O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCONFIG_CONFIG="$GITHUB_WORKSPACE/out/.config" olddefconfig
+
+          for x in CFG80211 MAC80211 RT2X00 RT2800USB RT2800USB_RT53XX; do
+            grep -q "^CONFIG_${x}=y$" "$GITHUB_WORKSPACE/out/.config" || { echo "ERROR: CONFIG_${x} not enabled"; exit 1; }
+          done
+          grep -q '^CONFIG_EXTRA_FIRMWARE="rt2870.bin"$' "$GITHUB_WORKSPACE/out/.config" || exit 1
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          make O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCONFIG_CONFIG="$GITHUB_WORKSPACE/out/.config" -j"$(nproc)" Image
+          test -s "$GITHUB_WORKSPACE/out/arch/arm64/boot/Image"
+
+      - name: Verify built image contains RT2800USB and firmware
+        run: |
+          strings out/arch/arm64/boot/Image | grep -m1 'rt2800usb' || true
+          strings out/arch/arm64/boot/Image | grep -m1 'rt2870.bin' || true
+          cp out/arch/arm64/boot/Image anykernel/Image.clo.ksu
+          cp kernel/firmware/LICENSE.ralink-firmware.txt anykernel/RT2800USB-FIRMWARE-LICENSE.txt
+          rm -f anykernel.zip
+          (cd anykernel && zip -qr9 ../YASK-USB-WIFI-CLO-KSU.zip .)
+
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: YASK-USB-WIFI-CLO-KSU
+          path: YASK-USB-WIFI-CLO-KSU.zip
+          if-no-files-found: error
